@@ -2,6 +2,9 @@ from langchain_ollama import OllamaLLM
 from langchain_classic.agents import initialize_agent, Tool
 from langchain_community.utilities import SQLDatabase
 from langchain_classic.memory import ConversationBufferMemory
+from langfuse.langchain import CallbackHandler
+from langfuse import Langfuse
+from langfuse import observe
 from dotenv import load_dotenv
 from sqlalchemy import text
 import requests
@@ -9,6 +12,8 @@ import re
 import os
 
 load_dotenv()
+langfuse_handler = CallbackHandler()
+
 PG_USER = os.getenv("PG_USER")
 PG_PASSWORD = os.getenv("PG_PASSWORD")
 PG_HOST = os.getenv("PG_HOST")
@@ -20,14 +25,20 @@ db_uri = f"postgresql+psycopg2://{PG_USER}:{PG_PASSWORD}@{PG_HOST}:{PG_PORT}/{PG
 db = SQLDatabase.from_uri(db_uri)
 
 ORS_URL = "https://api.openrouteservice.org/v2/directions/foot-walking"
-llm = OllamaLLM(model="qwen3:1.7b")
+llm = OllamaLLM(
+    model="qwen3:1.7b",
+    callbacks=[langfuse_handler]
+)
+judge_llm = OllamaLLM(model="qwen3:1.7b") 
 
+@observe(name="sql:get_data")
 def get_data(query: str, **kwargs):
     with db._engine.connect() as conn:
         result = conn.execute(text(query), kwargs)
         rows = result.fetchall()
     return rows
 
+@observe(name="tool:get_products")
 def get_products(input=None):
     rows = get_data("SELECT product, description FROM products;")
     if not rows:
@@ -56,7 +67,7 @@ def geocode(address: str):
     lon = float(data[0]["lon"])
     return lat, lon
 
-
+@observe(name="geo:get_distance")
 def get_distance(lat1, lon1, lat2, lon2):
     headers = {"Authorization": ORS_API_KEY, "Content-Type": "application/json"}
     body = {"coordinates": [[lon1, lat1], [lon2, lat2]]}
@@ -66,7 +77,7 @@ def get_distance(lat1, lon1, lat2, lon2):
     distance_m = data["routes"][0]["summary"].get("distance", 0.0)
     return round(distance_m / 1000, 2)
 
-
+@observe(name="tool:get_nearest_shops")
 def get_nearest_shops(address: str):
     address = str(address).strip().strip('"').strip("'")
     lat_user, lon_user = geocode(address)
@@ -82,7 +93,7 @@ def get_nearest_shops(address: str):
     nearest = sorted(distances, key=lambda x: x[2])
     return nearest
 
-
+@observe(name="tool:get_prices")
 def get_prices(product_name: str):
     product_name = str(product_name).strip().strip('"').strip("'")
     rows = get_data("""
@@ -113,7 +124,30 @@ agent = initialize_agent(
     llm=llm,
     agent_type="zero-shot-react-description",
     verbose=True,
-    handle_parsing_errors=True
+    handle_parsing_errors=True,
+    callbacks=[langfuse_handler],
 )
 
-print(agent.run("Покажи магазин где самая маленькая стоимость сыра"))
+def judge_answer(question, answer, tool_calls=None, extra_context=None):
+    prompt = f"""Ты — судья для агента. Ты оцениваешь содержание ответа агента на вопрос пользователя.
+                Посмотри ответ и оцени его: содержит ли он ответ на вопрос пользователя.
+                Вопрос пользователя:
+                {question}
+                Ответ агента:
+                {answer}
+
+                Оцени корректность ответа по шкале от 1 до 5,
+                где 5 — содержит всю необходимую информацию, 1 — не содержит необходимую информацию.
+                Дай в ответ только одно число.
+                """
+    llm_output = judge_llm.invoke(prompt)
+    score_value = round(float(llm_output[-1]))
+    return score_value
+
+
+question = "Сколько стоит молоко в ближайшем магазине к ул.Зинина 5"
+answer = agent.run(question)
+score = judge_answer(question, answer)
+
+print("Ответ агента:", answer)
+print("Оценка:", score)
